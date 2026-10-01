@@ -66,18 +66,18 @@ async function openMarkdownLink(markdownFileUri: vscode.Uri, href: string) {
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  // Register original command (used by context menu/shortcuts)
+  // Register the toggle command (used by context menus/shortcuts)
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      'markdown-editor.openEditor',
+      'markdown-editor.toggleEditor',
       (uri?: vscode.Uri, ...args) => {
         debug('command', uri, args)
-        EditorPanel.createOrShow(context, uri)
+        return toggleEditor(uri instanceof vscode.Uri ? uri : undefined)
       }
     )
   )
 
-  // Register CustomTextEditorProvider (for "Open With" and default editor)
+  // Register CustomTextEditorProvider (for the toggle command, "Open With" and default editor)
   context.subscriptions.push(
     vscode.window.registerCustomEditorProvider(
       MarkdownEditorProvider.viewType,
@@ -86,7 +86,8 @@ export function activate(context: vscode.ExtensionContext) {
         webviewOptions: {
           retainContextWhenHidden: true,
         },
-        supportsMultipleEditorsPerDocument: false,
+        // Every file gets its own editor, and one file can be open in several (e.g. split)
+        supportsMultipleEditorsPerDocument: true,
       }
     )
   )
@@ -95,24 +96,146 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 /**
- * Manages cat coding webview panels
+ * Id of the built-in text editor for vscode.openWith.
  */
-class EditorPanel {
-  /**
-   * Track the currently panel. Only allow a single panel to exist at a time.
-   */
-  public static currentPanel: EditorPanel | undefined
+const TextEditorViewType = 'default'
 
-  public static readonly viewType = 'markdown-editor'
+function tabUri(tab: vscode.Tab): vscode.Uri | undefined {
+  const { input } = tab
+  if (
+    input instanceof vscode.TabInputText ||
+    input instanceof vscode.TabInputCustom
+  ) {
+    return input.uri
+  }
+}
+
+function isMarkdownEditorTab(tab: vscode.Tab) {
+  return (
+    tab.input instanceof vscode.TabInputCustom &&
+    tab.input.viewType === MarkdownEditorProvider.viewType
+  )
+}
+
+/**
+ * Finds the tab the toggle command was called for: the active tab when no file is
+ * given (shortcut, command palette), otherwise a tab of that file (explorer and tab
+ * context menus), preferring the active group and the active tab.
+ */
+function findSourceTab(uri?: vscode.Uri): vscode.Tab | undefined {
+  const { activeTabGroup, all } = vscode.window.tabGroups
+  if (!uri) {
+    const tab = activeTabGroup.activeTab
+    return tab && tabUri(tab) ? tab : undefined
+  }
+  const isFileTab = (tab: vscode.Tab) =>
+    tabUri(tab)?.toString() === uri.toString()
+  for (const group of [activeTabGroup, ...all.filter((g) => !g.isActive)]) {
+    const tab =
+      group.activeTab && isFileTab(group.activeTab)
+        ? group.activeTab
+        : group.tabs.find(isFileTab)
+    if (tab) {
+      return tab
+    }
+  }
+}
+
+/**
+ * Switches a markdown file between the text editor and the markdown editor in
+ * place: the new editor takes over the tab it was called from instead of opening
+ * in a new one.
+ */
+async function toggleEditor(uri?: vscode.Uri) {
+  const tab = findSourceTab(uri)
+  uri = uri || (tab && tabUri(tab)) || vscode.window.activeTextEditor?.document.uri
+  if (!uri) {
+    showError(`Did not open markdown file!`)
+    return
+  }
+  const doc = await vscode.workspace.openTextDocument(uri)
+  if (doc.languageId !== 'markdown') {
+    showError(`Current file language is not markdown, got ${doc.languageId}`)
+    return
+  }
+  if (doc.isUntitled) {
+    showError(`Save the file first!`)
+    return
+  }
+  const fromMarkdownEditor = !!tab && isMarkdownEditorTab(tab)
+  const [sourceViewType, targetViewType] = fromMarkdownEditor
+    ? [MarkdownEditorProvider.viewType, TextEditorViewType]
+    : [TextEditorViewType, MarkdownEditorProvider.viewType]
+
+  // Nothing to replace, e.g. a file from the explorer that isn't open yet
+  if (!tab) {
+    await vscode.commands.executeCommand('vscode.openWith', uri, targetViewType, {
+      preview: false,
+    })
+    return
+  }
+
+  const viewColumn = tab.group.viewColumn
+  // A new tab opens right after the active one, so activate the tab being replaced
+  // first to put its replacement in the same place.
+  if (!tab.isActive) {
+    await vscode.commands.executeCommand('vscode.openWith', uri, sourceViewType, {
+      viewColumn,
+      preview: false,
+    })
+  }
+  if (fromMarkdownEditor) {
+    await MarkdownEditorProvider.flush(uri)
+  }
+  // Closing a tab with unsaved changes asks to save them even though the new tab
+  // shows the same document, and "Don't Save" there reverts the changes. Saving
+  // first keeps them and skips the dialog.
+  if (doc.isDirty && !(await doc.save())) {
+    return
+  }
+  await vscode.commands.executeCommand('vscode.openWith', uri, targetViewType, {
+    viewColumn,
+    preview: false,
+  })
+  await vscode.window.tabGroups.close(tab, true)
+}
+
+/**
+ * MarkdownEditorProvider implements CustomTextEditorProvider interface
+ * Supports opening markdown files via "Open With"
+ */
+class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
+  public static readonly viewType = 'markdown-editor.customEditor'
 
   /**
    * Remembers the last scroll position for each file, keyed by fsPath, so that
    * switching to another file and back doesn't reset the reading position.
-   * Shared across both the EditorPanel (singleton webview, disposed/recreated per
-   * file) and MarkdownEditorProvider (one webview per document via "Open With")
-   * entry points, since neither keeps the panel instance alive across a full close.
+   * Shared by all editors of the file, since none of them keeps its webview alive
+   * across a full close (toggling to the text editor and back included).
    */
   static _scrollPositions = new Map<string, number>()
+
+  /**
+   * Open editors, so the toggle command can reach the webview of the tab it replaces.
+   */
+  private static _editors = new Map<
+    vscode.WebviewPanel,
+    { uri: vscode.Uri; flush: () => Promise<void> }
+  >()
+
+  /**
+   * Makes the active editor of a file push input it hasn't synced yet into the
+   * document. The webview holds an edit back until typing pauses for 100ms, and an
+   * edit arriving after the editor lost focus is ignored (see 'edit'), so replacing
+   * the editor right after a keystroke would lose it.
+   */
+  static async flush(uri: vscode.Uri) {
+    for (const [panel, editor] of MarkdownEditorProvider._editors) {
+      if (panel.active && editor.uri.toString() === uri.toString()) {
+        await editor.flush()
+      }
+    }
+  }
 
   /**
    * Hides #app until BOTH of these are true: (a) the external main.css has actually
@@ -124,109 +247,11 @@ class EditorPanel {
    * its ready signal) *before* its own real CSS sizing has actually loaded, which
    * would flash an intermediate, oddly-scaled paint (e.g. toolbar buttons at native
    * SVG size) - most noticeable right after a file switch recreates the webview.
-   * This rule is deliberately inlined into the HTML <head> of both webview templates
+   * This rule is deliberately inlined into the HTML <head> of the webview template
    * rather than placed in main.css itself, since that stylesheet is exactly the
    * thing this rule needs to not depend on to take effect.
    */
   static appVisibilityCss = `#app{opacity:0}body[data-vmd-ready="1"][data-vmd-css-loaded="1"] #app{opacity:1}`
-
-  private _disposables: vscode.Disposable[] = []
-
-  public static async createOrShow(
-    context: vscode.ExtensionContext,
-    uri?: vscode.Uri
-  ) {
-    const { extensionUri } = context
-    const column = vscode.window.activeTextEditor
-      ? vscode.window.activeTextEditor.viewColumn
-      : undefined
-    // Known limitation: switching files disposes and recreates this panel (a brand
-    // new webview), which can trigger a VS Code platform-level transition where the
-    // new webview briefly renders at the wrong zoom level before VS Code's own
-    // zoom-sync (Electron webContents.setZoomFactor, applied outside this page's
-    // control) settles - see PR #166. Confirmed this is specific to that dispose+
-    // recreate transition, not "any new webview": the *first* panel ever opened in a
-    // session does not show it, only switching to a different file does. Reusing the
-    // same panel across file switches (updating its bound document in place, the
-    // same flash-free mechanism already used for theme changes) would likely avoid
-    // it, but requires also keeping <base href> (used to resolve relative image/file
-    // links) in sync with whichever file is currently bound instead of baking it into
-    // the HTML once at panel-creation time - deliberately not done here for now.
-    if (EditorPanel.currentPanel && uri !== EditorPanel.currentPanel?._uri) {
-      EditorPanel.currentPanel.dispose()
-    }
-    // If we already have a panel, show it.
-    if (EditorPanel.currentPanel) {
-      EditorPanel.currentPanel._panel.reveal(column)
-      EditorPanel.currentPanel._panel.webview.postMessage({ command: 'focus' })
-      return
-    }
-    if (!vscode.window.activeTextEditor && !uri) {
-      showError(`Did not open markdown file!`)
-      return
-    }
-    let doc: undefined | vscode.TextDocument
-    // From context menu: Find if there is a markdown editor for the current active TextEditor, if so bind the document
-    if (uri) {
-      // Open file from context menu: Open document first then enable auto-sync, otherwise cannot save file or sync to opened document
-      doc = await vscode.workspace.openTextDocument(uri)
-    } else {
-      doc = vscode.window.activeTextEditor?.document
-      // from command mode
-      if (doc && doc.languageId !== 'markdown') {
-        showError(
-          `Current file language is not markdown, got ${doc.languageId}`
-        )
-        return
-      }
-    }
-
-    if (!doc) {
-      showError(`Cannot find markdown file!`)
-      return
-    }
-
-    // Otherwise, create a new panel.
-    const panel = vscode.window.createWebviewPanel(
-      EditorPanel.viewType,
-      'markdown-editor',
-      column || vscode.ViewColumn.One,
-      EditorPanel.getWebviewOptions(uri)
-    )
-
-    EditorPanel.currentPanel = new EditorPanel(
-      context,
-      panel,
-      extensionUri,
-      doc,
-      uri
-    )
-  }
-
-  private static getFolders(): vscode.Uri[] {
-    const data = []
-    for (let i = 65; i <= 90; i++) {
-      data.push(vscode.Uri.file(`${String.fromCharCode(i)}:/`))
-    }
-    return data
-  }
-
-  static getWebviewOptions(
-    uri?: vscode.Uri
-  ): vscode.WebviewOptions & vscode.WebviewPanelOptions {
-    return {
-      // Enable javascript in the webview
-      enableScripts: true,
-
-      localResourceRoots: [vscode.Uri.file("/"), ...this.getFolders()],
-      retainContextWhenHidden: true,
-      enableCommandUris: true,
-      enableFindWidget: true,
-    }
-  }
-  private get _fsPath() {
-    return this._uri.fsPath
-  }
 
   static get config() {
     return vscode.workspace.getConfiguration('markdown-editor')
@@ -237,14 +262,14 @@ class EditorPanel {
    */
   static getVditorOptions(context: vscode.ExtensionContext): any {
     return {
-      useVscodeThemeColor: EditorPanel.config.get<boolean>(
+      useVscodeThemeColor: MarkdownEditorProvider.config.get<boolean>(
         'useVscodeThemeColor'
       ),
-      showLineNumbers: EditorPanel.config.get<boolean>(
+      showLineNumbers: MarkdownEditorProvider.config.get<boolean>(
         'showLineNumbers'
       ),
       outline: {
-        enable: EditorPanel.config.get<boolean>(
+        enable: MarkdownEditorProvider.config.get<boolean>(
           'defaultOpenOutline'
         ) === true,
       },
@@ -368,161 +393,9 @@ class EditorPanel {
 })();
 </script>`
 
-  private constructor(
-    private readonly _context: vscode.ExtensionContext,
-    private readonly _panel: vscode.WebviewPanel,
-    private readonly _extensionUri: vscode.Uri,
-    public _document: vscode.TextDocument,
-    public _uri = _document.uri // Opened from explorer, only uri exists, no _document
-  ) {
-    // Set the webview's initial html content
-
-    this._init()
-
-    // Listen for when the panel is disposed
-    // This happens when the user closes the panel or when the panel is closed programmatically
-    this._panel.onDidDispose(() => this.dispose(), null, this._disposables)
-    let textEditTimer: NodeJS.Timeout | void
-    // close EditorPanel when vsc editor is close
-    vscode.workspace.onDidCloseTextDocument((e) => {
-      if (e.fileName === this._fsPath) {
-        this.dispose()
-      }
-    }, this._disposables)
-    // re-init webview when VS Code theme changes
-    vscode.window.onDidChangeActiveColorTheme((theme) => {
-      this._update({
-        type: 'init',
-        options: EditorPanel.getVditorOptions(this._context),
-        theme: theme.kind === vscode.ColorThemeKind.Dark ? 'dark' : 'light',
-      })
-    }, null, this._disposables)
-    // update EditorPanel when vsc editor changes
-    vscode.workspace.onDidChangeTextDocument((e) => {
-      if (e.document.fileName !== this._document.fileName) {
-        return
-      }
-      // Don't echo the webview's own edits back at it, but always take a change that
-      // came from disk: the panel stays "active" while another program has focus, so
-      // this would otherwise drop every external edit.
-      if (this._panel.active && !isExternalReload(e)) {
-        return
-      }
-      textEditTimer && clearTimeout(textEditTimer)
-      textEditTimer = setTimeout(() => {
-        this._update()
-        this._updateEditTitle()
-      }, 300)
-    }, this._disposables)
-    // Handle messages from the webview
-    this._panel.webview.onDidReceiveMessage(
-      async (message) => {
-        debug('msg from webview review', message, this._panel.active)
-
-        const syncToEditor = async () => {
-          debug('sync to editor', this._document, this._uri)
-          if (this._document) {
-            const edit = new vscode.WorkspaceEdit()
-            edit.replace(
-              this._document.uri,
-              new vscode.Range(0, 0, this._document.lineCount, 0),
-              message.content
-            )
-            await vscode.workspace.applyEdit(edit)
-          } else if (this._uri) {
-            await vscode.workspace.fs.writeFile(this._uri, message.content)
-          } else {
-            showError(`Cannot find original file to save!`)
-          }
-        }
-        switch (message.command) {
-          case 'ready': {
-            this._update({
-              type: 'init',
-              options: EditorPanel.getVditorOptions(this._context),
-              theme:
-                vscode.window.activeColorTheme.kind ===
-                  vscode.ColorThemeKind.Dark
-                  ? 'dark'
-                  : 'light',
-            })
-            break
-          }
-          case 'save-options':
-            this._context.globalState.update(KeyVditorOptions, message.options)
-            break
-          case 'scroll':
-            EditorPanel._scrollPositions.set(this._fsPath, message.top || 0)
-            break
-          case 'info':
-            vscode.window.showInformationMessage(message.content)
-            break
-          case 'error':
-            showError(message.content)
-            break
-          case 'edit': {
-            // Only sync to VS Code editor when webview is in edit mode to avoid repeated refresh
-            if (this._panel.active) {
-              await syncToEditor()
-              this._updateEditTitle()
-            }
-            break
-          }
-          case 'reset-config': {
-            await this._context.globalState.update(KeyVditorOptions, {})
-            break
-          }
-          case 'save': {
-            await syncToEditor()
-            await this._document.save()
-            this._updateEditTitle()
-            break
-          }
-          case 'upload': {
-            const assetsFolder = EditorPanel.getAssetsFolder(this._uri)
-            try {
-              await vscode.workspace.fs.createDirectory(
-                vscode.Uri.file(assetsFolder)
-              )
-            } catch (error) {
-              console.error(error)
-              showError(`Invalid image folder: ${assetsFolder}`)
-            }
-            await Promise.all(
-              message.files.map(async (f: any) => {
-                const content = Buffer.from(f.base64, 'base64')
-                return vscode.workspace.fs.writeFile(
-                  vscode.Uri.file(NodePath.join(assetsFolder, f.name)),
-                  content
-                )
-              })
-            )
-            const files = message.files.map((f: any) =>
-              NodePath.relative(
-                NodePath.dirname(this._fsPath),
-                NodePath.join(assetsFolder, f.name)
-              ).replace(/\\/g, '/')
-            )
-            this._panel.webview.postMessage({
-              command: 'uploaded',
-              files,
-            })
-            break
-          }
-          case 'open-link': {
-            await openMarkdownLink(this._uri, message.href)
-            break
-          }
-        }
-      },
-      null,
-      this._disposables
-    )
-  }
-
   static getAssetsFolder(uri: vscode.Uri) {
     const imageSaveFolder = (
-      EditorPanel.config.get<string>('imageSaveFolder') || 'assets'
+      MarkdownEditorProvider.config.get<string>('imageSaveFolder') || 'assets'
     )
       .replace(
         '${projectRoot}',
@@ -541,114 +414,12 @@ class EditorPanel {
     return assetsFolder
   }
 
-  public dispose() {
-    EditorPanel.currentPanel = undefined
-
-    // Clean up our resources
-    this._panel.dispose()
-
-    while (this._disposables.length) {
-      const x = this._disposables.pop()
-      if (x) {
-        x.dispose()
-      }
-    }
-  }
-
-  private _init() {
-    const webview = this._panel.webview
-
-    this._panel.webview.html = this._getHtmlForWebview(webview)
-    this._panel.title = NodePath.basename(this._fsPath)
-  }
-  private _isEdit = false
-  private _updateEditTitle() {
-    const isEdit = this._document.isDirty
-    if (isEdit !== this._isEdit) {
-      this._isEdit = isEdit
-      this._panel.title = `${isEdit ? `[edit]` : ''}${NodePath.basename(
-        this._fsPath
-      )}`
-    }
-  }
-
-  // private fileToWebviewUri = (f: string) => {
-  //   return this._panel.webview.asWebviewUri(vscode.Uri.file(f)).toString()
-  // }
-
-  private async _update(
-    props: {
-      type?: 'init' | 'update'
-      options?: any
-      theme?: 'dark' | 'light'
-    } = { options: void 0 }
-  ) {
-    const md = this._document
-      ? this._document.getText()
-      : (await vscode.workspace.fs.readFile(this._uri)).toString()
-    // const dir = NodePath.dirname(this._document.fileName)
-    this._panel.webview.postMessage({
-      command: 'update',
-      content: md,
-      ...(props.type === 'init'
-        ? { scrollTop: EditorPanel._scrollPositions.get(this._fsPath) || 0 }
-        : {}),
-      ...props,
-    })
-  }
-
-  private _getHtmlForWebview(webview: vscode.Webview) {
-    const toUri = (f: string) =>
-      webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, f))
-    const baseHref =
-      NodePath.dirname(
-        webview.asWebviewUri(vscode.Uri.file(this._fsPath)).toString()
-      ) + '/'
-    const toMediaPath = (f: string) => `media/dist/${f}`
-    const JsFiles = ['main.js'].map(toMediaPath).map(toUri)
-    const CssFiles = ['main.css'].map(toMediaPath).map(toUri)
-
-    return (
-      `<!DOCTYPE html>
-			<html lang="en">
-			<head>
-				<meta charset="UTF-8">
-
-				<meta name="viewport" content="width=device-width, initial-scale=1.0">
-				<base href="${baseHref}" />
-
-				<style>${EditorPanel.appVisibilityCss}</style>
-
-				${CssFiles.map((f) => `<link href="${f}" rel="stylesheet" onload="document.body.setAttribute('data-vmd-css-loaded','1')" onerror="document.body.setAttribute('data-vmd-css-loaded','1')">`).join('\n')}
-
-				<title>markdown editor</title>
-        <style>` +
-      EditorPanel.config.get<string>('customCss') +
-      `</style>
-			</head>
-			<body>
-				<div id="app"></div>
-
-
-				${JsFiles.map((f) => `<script src="${f}"></script>`).join('\n')}
-				${EditorPanel.config.get<boolean>('showLineNumbers') !== false ? EditorPanel.lineNumberScript : ''}
-			</body>
-			</html>`
-    )
-  }
-}
-
-/**
- * MarkdownEditorProvider implements CustomTextEditorProvider interface
- * Supports opening markdown files via "Open With"
- */
-class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
-  public static readonly viewType = 'markdown-editor.customEditor'
 
   constructor(private readonly context: vscode.ExtensionContext) { }
 
   /**
-   * Called when user selects Markdown Editor via "Open With"
+   * Called when the markdown editor opens a file: the toggle command, "Open With" or
+   * the default editor
    */
   public async resolveCustomTextEditor(
     document: vscode.TextDocument,
@@ -665,6 +436,19 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
     const disposables: vscode.Disposable[] = []
     let isEditing = false
+    let lastSync = Promise.resolve()
+    let onFlushed: (() => void) | undefined
+
+    MarkdownEditorProvider._editors.set(webviewPanel, {
+      uri,
+      flush: () =>
+        new Promise<void>((resolve) => {
+          onFlushed = resolve
+          webviewPanel.webview.postMessage({ command: 'flush' })
+          // Don't hang on a webview that never answers, e.g. one still loading
+          setTimeout(resolve, 1000)
+        }),
+    })
 
     // Update title to show edit status
     const updateEditTitle = () => {
@@ -681,7 +465,7 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         command: 'update',
         content: document.getText(),
         ...(props.type === 'init'
-          ? { scrollTop: EditorPanel._scrollPositions.get(uri.fsPath) || 0 }
+          ? { scrollTop: MarkdownEditorProvider._scrollPositions.get(uri.fsPath) || 0 }
           : {}),
         ...props,
       })
@@ -692,6 +476,15 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       if (e.fileName === uri.fsPath) {
         webviewPanel.dispose()
       }
+    }, null, disposables)
+
+    // re-init webview when VS Code theme changes
+    vscode.window.onDidChangeActiveColorTheme((theme) => {
+      updateWebview({
+        type: 'init',
+        options: MarkdownEditorProvider.getVditorOptions(this.context),
+        theme: theme.kind === vscode.ColorThemeKind.Dark ? 'dark' : 'light',
+      })
     }, null, disposables)
 
     // Listen for document changes (sync from external editor to webview)
@@ -726,7 +519,7 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         case 'ready':
           updateWebview({
             type: 'init',
-            options: EditorPanel.getVditorOptions(this.context),
+            options: MarkdownEditorProvider.getVditorOptions(this.context),
             theme: vscode.window.activeColorTheme.kind === vscode.ColorThemeKind.Dark ? 'dark' : 'light',
           })
           break
@@ -734,7 +527,7 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
           this.context.globalState.update(KeyVditorOptions, message.options)
           break
         case 'scroll':
-          EditorPanel._scrollPositions.set(uri.fsPath, message.top || 0)
+          MarkdownEditorProvider._scrollPositions.set(uri.fsPath, message.top || 0)
           break
         case 'info':
           vscode.window.showInformationMessage(message.content)
@@ -744,9 +537,19 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
           break
         case 'edit':
           if (webviewPanel.active) {
-            await syncToEditor()
+            lastSync = syncToEditor()
+            await lastSync
             updateEditTitle()
           }
+          break
+        case 'flushed':
+          // content is only set when the webview had an edit it hadn't sent yet
+          if (message.content !== undefined) {
+            lastSync = syncToEditor()
+          }
+          await lastSync
+          updateEditTitle()
+          onFlushed?.()
           break
         case 'reset-config':
           await this.context.globalState.update(KeyVditorOptions, {})
@@ -757,7 +560,7 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
           updateEditTitle()
           break
         case 'upload': {
-          const assetsFolder = EditorPanel.getAssetsFolder(uri)
+          const assetsFolder = MarkdownEditorProvider.getAssetsFolder(uri)
           try {
             await vscode.workspace.fs.createDirectory(vscode.Uri.file(assetsFolder))
           } catch (error) {
@@ -791,6 +594,7 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
     // Clean up resources
     webviewPanel.onDidDispose(() => {
+      MarkdownEditorProvider._editors.delete(webviewPanel)
       disposables.forEach((d) => d.dispose())
     })
   }
@@ -828,13 +632,13 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 				<meta name="viewport" content="width=device-width, initial-scale=1.0">
 				<base href="${baseHref}" />
 
-				<style>${EditorPanel.appVisibilityCss}</style>
+				<style>${MarkdownEditorProvider.appVisibilityCss}</style>
 
 				${CssFiles.map((f) => `<link href="${f}" rel="stylesheet" onload="document.body.setAttribute('data-vmd-css-loaded','1')" onerror="document.body.setAttribute('data-vmd-css-loaded','1')">`).join('\n')}
 
 				<title>markdown editor</title>
         <style>` +
-      EditorPanel.config.get<string>('customCss') +
+      MarkdownEditorProvider.config.get<string>('customCss') +
       `</style>
 			</head>
 			<body>
@@ -842,7 +646,7 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
 
 				${JsFiles.map((f) => `<script src="${f}"></script>`).join('\n')}
-				${EditorPanel.config.get<boolean>('showLineNumbers') !== false ? EditorPanel.lineNumberScript : ''}
+				${MarkdownEditorProvider.config.get<boolean>('showLineNumbers') !== false ? MarkdownEditorProvider.lineNumberScript : ''}
 			</body>
 			</html>`
     )

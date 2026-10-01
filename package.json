@@ -7,7 +7,7 @@
   "publisher": "zaaack",
   "private": true,
   "engines": {
-    "vscode": "^1.47.0"
+    "vscode": "^1.67.0"
   },
   "categories": [
     "Programming Languages",
@@ -22,8 +22,7 @@
     "markdown-editor"
   ],
   "activationEvents": [
-    "onCommand:markdown-editor.openEditor",
-    "onWebviewPanel:markdown-editor",
+    "onCommand:markdown-editor.toggleEditor",
     "onLanguage:markdown",
     "onCustomEditor:markdown-editor.customEditor"
   ],
@@ -35,8 +34,8 @@
   "contributes": {
     "commands": [
       {
-        "command": "markdown-editor.openEditor",
-        "title": "Open with markdown editor",
+        "command": "markdown-editor.toggleEditor",
+        "title": "Toggle markdown editor",
         "category": "markdown-editor"
       }
     ],
@@ -44,14 +43,14 @@
       "explorer/context": [
         {
           "when": "resourceLangId == markdown",
-          "command": "markdown-editor.openEditor",
+          "command": "markdown-editor.toggleEditor",
           "group": "navigation"
         }
       ],
       "editor/title/context": [
         {
           "when": "resourceLangId == markdown",
-          "command": "markdown-editor.openEditor",
+          "command": "markdown-editor.toggleEditor",
           "group": "1_open"
         }
       ]
@@ -103,9 +102,9 @@
     "keybindings": [
       {
         "key": "ctrl+shift+alt+m",
-        "command": "markdown-editor.openEditor",
+        "command": "markdown-editor.toggleEditor",
         "mac": "cmd+shift+alt+m",
-        "when": "editorTextFocus && editorLangId == markdown"
+        "when": "editorTextFocus && editorLangId == markdown || activeCustomEditorId == 'markdown-editor.customEditor'"
       }
     ]
   },
@@ -117,7 +116,7 @@
   },
   "devDependencies": {
     "@types/node": "^12.12.0",
-    "@types/vscode": "^1.47.0",
+    "@types/vscode": "^1.67.0",
     "esbuild": "^0.28.0",
     "foy": "^0.2.5",
     "ts-node": "9.1.1",

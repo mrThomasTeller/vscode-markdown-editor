@@ -45,10 +45,9 @@ function getScrollEl(): HTMLElement | null {
 }
 
 // Reports the current scroll position to the extension host so it can be restored
-// later. This matters because the extension host disposes and recreates the whole
-// webview whenever a different file is opened (single shared panel / re-resolved
-// custom editor), which would otherwise reset the reading position back to the top
-// every time you switch files.
+// later. This matters because the extension host disposes the whole webview whenever
+// the editor is closed or toggled to the text editor, which would otherwise reset the
+// reading position back to the top every time you come back to the file.
 //
 // Coordinates with restoreScrollPosition() below via a small shared record (rather
 // than a simple boolean "restoring" flag): a scroll event whose resulting position
@@ -162,6 +161,9 @@ function restoreScrollPosition(scrollTop: number) {
   }, POLL_MS)
 }
 
+// Pending 'edit' report, see input() below and the 'flush' message
+let inputTimer
+
 function initVditor(msg) {
   console.log('msg', msg)
   // Hide the editor again for the duration of this (re)build - see main.css and the
@@ -170,7 +172,6 @@ function initVditor(msg) {
   // change reuses the same webview), which would otherwise skip re-hiding and show
   // the intermediate rebuild state.
   document.body.removeAttribute('data-vmd-ready')
-  let inputTimer
   let defaultOptions: any = {}
   defaultOptions = merge(defaultOptions, msg.options, {
     preview: {
@@ -227,6 +228,7 @@ function initVditor(msg) {
     input() {
       inputTimer && clearTimeout(inputTimer)
       inputTimer = setTimeout(() => {
+        inputTimer = undefined
         vscode.postMessage({ command: 'edit', content: vditor.getValue() })
       }, 100)
     },
@@ -283,6 +285,18 @@ window.addEventListener('message', (e) => {
     }
     case 'focus': {
       vditor.focus()
+      break
+    }
+    case 'flush': {
+      // The extension is about to replace this editor: send the edit input() is
+      // still holding back right away instead of losing it
+      let content
+      if (inputTimer) {
+        clearTimeout(inputTimer)
+        inputTimer = undefined
+        content = vditor.getValue()
+      }
+      vscode.postMessage({ command: 'flushed', content })
       break
     }
     case 'uploaded': {

@@ -29,26 +29,28 @@
 
 ## Usage
 
+`Toggle markdown editor` switches a markdown file between the text editor and the markdown editor right in its tab: the tab it is called from is replaced, no new tab is opened. Calling it again switches back. Unsaved changes are saved before the switch. Several files can be open in markdown editors at the same time, and one file can be open in several of them (e.g. split).
+
 ### 1. Command mode in markdown file
 
 - open a markdown file
 - type `cmd-shift-p` to enter command mode
-- type `markdown-editor: Open with markdown editor`
+- type `markdown-editor: Toggle markdown editor`
 
 ### 2. Key bindings
 
-- open a markdown file
+- open a markdown file (or focus its markdown editor)
 - type `ctrl+shift+alt+m` for win or `cmd+shift+alt+m` for mac
 
 ### 3. Explorer Context menu
 
 - right click on markdown file
-- then click `Open with markdown editor`
+- then click `Toggle markdown editor`
 
 ### 4. Editor title context menu
 
 - right click on a opened markdown file's tab title
-- then click `Open with markdown editor`
+- then click `Toggle markdown editor`
 
 ### 5. Open With... and Set Default Editor
 
@@ -72,10 +74,6 @@ Edit your settings.json and add
 - [vscode](https://github.com/microsoft/vscode)
 - [vditor](https://github.com/Vanessa219/vditor)
 
-
-## Todo
-
-- [ ] Using [Custom Text Editor](https://code.visualstudio.com/api/extension-guides/custom-editors#custom-text-editor) ([demo](https://github.com/gera2ld/markmap-vscode))
 
 ## License
 
