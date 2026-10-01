@@ -110,11 +110,14 @@ function tabUri(tab: vscode.Tab): vscode.Uri | undefined {
   }
 }
 
-function isMarkdownEditorTab(tab: vscode.Tab) {
-  return (
-    tab.input instanceof vscode.TabInputCustom &&
-    tab.input.viewType === MarkdownEditorProvider.viewType
-  )
+/**
+ * Editor a tab shows, as a view type for vscode.openWith.
+ */
+function tabViewType(tab: vscode.Tab) {
+  const { input } = tab
+  return input instanceof vscode.TabInputCustom
+    ? input.viewType
+    : TextEditorViewType
 }
 
 /**
@@ -162,10 +165,11 @@ async function toggleEditor(uri?: vscode.Uri) {
     showError(`Save the file first!`)
     return
   }
-  const fromMarkdownEditor = !!tab && isMarkdownEditorTab(tab)
-  const [sourceViewType, targetViewType] = fromMarkdownEditor
-    ? [MarkdownEditorProvider.viewType, TextEditorViewType]
-    : [TextEditorViewType, MarkdownEditorProvider.viewType]
+  const fromMarkdownEditor =
+    !!tab && tabViewType(tab) === MarkdownEditorProvider.viewType
+  const targetViewType = fromMarkdownEditor
+    ? TextEditorViewType
+    : MarkdownEditorProvider.viewType
 
   // Nothing to replace, e.g. a file from the explorer that isn't open yet
   if (!tab) {
@@ -176,6 +180,7 @@ async function toggleEditor(uri?: vscode.Uri) {
   }
 
   const viewColumn = tab.group.viewColumn
+  const sourceViewType = tabViewType(tab)
   // A new tab opens right after the active one, so activate the tab being replaced
   // first to put its replacement in the same place.
   if (!tab.isActive) {
@@ -197,7 +202,18 @@ async function toggleEditor(uri?: vscode.Uri) {
     viewColumn,
     preview: false,
   })
-  await vscode.window.tabGroups.close(tab, true)
+  // Look the replaced tab up again: tab objects may go stale once tabs change
+  // (Cursor recreates them all, and closing a stale one throws)
+  const replaced = vscode.window.tabGroups.all
+    .find((g) => g.viewColumn === viewColumn)
+    ?.tabs.find(
+      (t) =>
+        tabUri(t)?.toString() === uri!.toString() &&
+        tabViewType(t) === sourceViewType
+    )
+  if (replaced) {
+    await vscode.window.tabGroups.close(replaced, true)
+  }
 }
 
 /**
